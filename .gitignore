@@ -1,0 +1,4 @@
+__pycache__
+activation_cache
+wandb
+tmp

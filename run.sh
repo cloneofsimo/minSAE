@@ -1,0 +1,11 @@
+python sae.py \
+    --model-name meta-llama/Llama-2-7b-hf \
+    --layer-idx 8 \
+    --cache-dir activation_cache \
+    --d-hidden 2048 \
+    --learning-rate 1e-3 \
+    --batch-size 2 \
+    --wandb-project test_sae_project \
+    --num-train-samples 10000 \
+    --num-val-samples 100 \
+    --overwrite-cache
