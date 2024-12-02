@@ -38,6 +38,22 @@ python sae.py \
     --overwrite-cache
 ```
 
+### Choosing the Sparse Autoencoder Type
+
+You can choose between two types of sparse autoencoders: ReLU and TopK. Use the `--sae-type` option to specify which one to use:
+
+- **ReLU Autoencoder**: This is the default option. It uses a ReLU activation function and an L1 regularization term to encourage sparsity.
+  
+  ```bash
+  python sae.py --sae-type relu
+  ```
+
+- **TopK Autoencoder**: This autoencoder selects the top K activations, setting the rest to zero, which can be specified with the `--topk` option.
+
+  ```bash
+  python sae.py --sae-type topk --topk 100
+  ```
+
 ## Citation
 
 ```bibtex

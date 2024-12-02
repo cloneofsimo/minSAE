@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import click
 import numpy as np
@@ -22,6 +22,7 @@ def cache_activations(
     num_train_samples: Optional[int] = None,
     num_val_samples: Optional[int] = None,
     shard_size: int = 10000,
+    batch_size: int = 8,  # Added batch size parameter
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     dtype: torch.dtype = torch.float16,
     split: str = "train",
@@ -89,7 +90,7 @@ def cache_activations(
             act.shape[-1] == d_model
         ), f"Wrong activation dimension: {act.shape[-1]} vs {d_model}"
 
-        current_activations.append(act)
+        current_activations.extend(list(act))
 
     # Register hook on the MLP output
     hook_registered = False
@@ -104,10 +105,13 @@ def cache_activations(
     print("\nCollecting activations...")
     try:
         with torch.no_grad():
-            for sample in tqdm(dataset):
-                # Tokenize
+            # Process data in batches
+            for i in tqdm(range(0, len(dataset), batch_size)):
+                batch_samples = dataset[i : i + batch_size]
+
+                # Tokenize batch
                 inputs = tokenizer(
-                    sample["text"],
+                    batch_samples["text"],
                     max_length=context_length,
                     truncation=True,
                     padding="max_length",
@@ -119,7 +123,7 @@ def cache_activations(
                 model(**inputs)
 
                 # Update counters
-                samples_processed += 1
+                samples_processed += len(batch_samples["text"])
                 total_tokens_processed += inputs["input_ids"].numel()
 
                 # Save shard if enough activations
@@ -174,61 +178,99 @@ def cache_activations(
 
 
 class ActivationLoader:
-    """Simple activation data loader that loads and shuffles shards."""
+    """Activation data loader that loads N shards at a time and shuffles between them."""
 
     def __init__(
-        self, cache_dir: str, split: str, batch_size: int, shuffle: bool = True
+        self,
+        cache_dir: str,
+        split: str,
+        batch_size: int,
+        shuffle: bool = True,
+        num_shards_in_memory: int = 4,
     ):
         self.cache_dir = Path(cache_dir) / split
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.num_shards_in_memory = num_shards_in_memory
 
         # Load metadata
         with open(self.cache_dir / "metadata.json") as f:
             self.metadata = json.load(f)
 
         self.shard_paths = sorted(self.cache_dir.glob("shard_*.safetensors"))
-        self.current_shard = None
+        if self.shuffle:
+            np.random.shuffle(self.shard_paths)
+
+        self.current_shards = []
         self.current_indices = None
+        self.next_shard_idx = 0
 
     def load_shard(self, shard_path: Path) -> torch.Tensor:
         """Load a single shard of activations."""
         data = load_file(str(shard_path))
         return data["activations"]
 
-    def __iter__(self):
-        # Shuffle shard order if requested
+    def load_next_shards(self):
+        """Load next N shards into memory."""
+        self.current_shards = []
+        if self.next_shard_idx >= len(self.shard_paths):
+            return False
+
+        end_idx = min(
+            self.next_shard_idx + self.num_shards_in_memory, len(self.shard_paths)
+        )
+
+        for shard_path in self.shard_paths[self.next_shard_idx : end_idx]:
+            self.current_shards.append(self.load_shard(shard_path))
+
+        print("Loaded new shards", self.current_shards)
+        self.next_shard_idx = end_idx
+
+        # Concatenate shards and create shuffled indices
+        self.current_data = torch.cat(self.current_shards, dim=0)
         if self.shuffle:
-            np.random.shuffle(self.shard_paths)
+            self.current_indices = torch.randperm(len(self.current_data))
+        else:
+            self.current_indices = None
 
-        for shard_path in self.shard_paths:
-            # Load and shuffle shard
-            self.current_shard = self.load_shard(shard_path)
-            self.current_indices = (
-                torch.randperm(len(self.current_shard)) if self.shuffle else None
-            )
+        print("Current data", self.current_data.shape)
 
-            # Yield batches from current shard
-            for start_idx in range(0, len(self.current_shard), self.batch_size):
-                end_idx = min(start_idx + self.batch_size, len(self.current_shard))
+        return len(self.current_data) > 0
+
+    def __iter__(self):
+
+        self.next_shard_idx = 0
+
+        # Load first batch of shards
+        has_data = self.load_next_shards()
+
+        while has_data:
+            # Yield batches from current shards
+            for start_idx in range(0, len(self.current_data), self.batch_size):
+                end_idx = min(start_idx + self.batch_size, len(self.current_data))
 
                 if self.current_indices is not None:
                     indices = self.current_indices[start_idx:end_idx]
-                    batch = self.current_shard[indices]
+                    batch = self.current_data[indices]
                 else:
-                    batch = self.current_shard[start_idx:end_idx]
+                    batch = self.current_data[start_idx:end_idx]
 
                 yield batch
 
+            # Load next batch of shards when current ones are exhausted
+            has_data = self.load_next_shards()
 
-class SparseAutoencoder(nn.Module):
-    """Sparse autoencoder using nn.Linear layers."""
 
-    def __init__(self, d_input: int, d_hidden: int):
+class SparseReLUAutoencoder(nn.Module):
+    """Sparse ReLU autoencoder. This is typically considered a baseline SAE."""
+
+    def __init__(self, d_input: int, d_hidden: int, l1_coef: float = 1e-3):
         super().__init__()
         self.encoder = nn.Linear(d_input, d_hidden)
         self.decoder = nn.Linear(d_hidden, d_input)
         self.activation = nn.ReLU()
+        self.l1_coef = l1_coef
+        self.mse_loss = nn.MSELoss()
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.activation(self.encoder(x))
@@ -236,9 +278,67 @@ class SparseAutoencoder(nn.Module):
     def decode(self, h: torch.Tensor) -> torch.Tensor:
         return self.decoder(h)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         h = self.encode(x)
-        return self.decode(h), h
+        decoded = self.decode(h)
+
+        # Calculate losses
+        recon_loss = self.mse_loss(decoded.float(), x.float())
+        l1_loss = h.abs().mean()
+        total_loss = recon_loss + l1_loss * self.l1_coef
+
+        with torch.no_grad():
+            l0_loss = (h != 0).float().mean()
+
+        return {
+            "decoded": decoded,
+            "encoded": h,
+            "loss": total_loss,
+            "recon_loss": recon_loss,
+            "l1_loss": l1_loss,
+            "l0_loss": l0_loss,
+        }
+
+
+class SparseTopKAutoEncoder(nn.Module):
+    """Sparse TopK autoencoder from Scaling and evaluating sparse autoencoders. https://arxiv.org/abs/2406.04093"""
+
+    def __init__(self, d_input: int, d_hidden: int, topk: int = 10):
+        super().__init__()
+        self.encoder = nn.Linear(d_input, d_hidden)
+        self.decoder = nn.Linear(d_hidden, d_input)
+        self.activation = nn.ReLU()
+        self.topk = topk
+        self.mse_loss = nn.MSELoss()
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.activation(self.encoder(x))
+        topk_ind = h.topk(k=self.topk, dim=-1, sorted=False).indices
+        # return topk as is, rest as zero
+        topk_mask = torch.zeros_like(h)
+        topk_mask.scatter_(dim=-1, index=topk_ind, value=1)
+        return h * topk_mask
+
+    def decode(self, h: torch.Tensor) -> torch.Tensor:
+        return self.decoder(h)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        h = self.encode(x)
+        decoded = self.decode(h)
+        recon_loss = self.mse_loss(decoded.float(), x.float())
+        l1_loss = h.abs().mean()
+
+        with torch.no_grad():
+            l0_loss = (h != 0).float().mean()
+
+        return {
+            "decoded": decoded,
+            "encoded": h,
+            "loss": recon_loss,
+            "recon_loss": recon_loss,
+            "l1_loss": l1_loss,
+            "l0_loss": l0_loss,
+        }
 
 
 @click.command()
@@ -253,6 +353,7 @@ class SparseAutoencoder(nn.Module):
 @click.option("--batch-size", default=1024, help="Batch size")
 @click.option("--shard-size", default=10000, help="Activations per shard")
 @click.option("--l1-coef", default=1e-3, help="L1 loss coefficient")
+@click.option("--topk", default=100, help="TopK for TopK SAE")
 @click.option("--num-epochs", default=10, help="Number of epochs")
 @click.option(
     "--num-train-samples", default=None, type=int, help="Number of training samples"
@@ -263,6 +364,7 @@ class SparseAutoencoder(nn.Module):
 @click.option("--wandb-project", default="sae-training", help="W&B project name")
 @click.option("--wandb-run-name", default=None, help="W&B run name")
 @click.option("--overwrite-cache", is_flag=True, help="Overwrite cache")
+@click.option("--sae-type", default="relu", help="SAE type")
 def train_sae(
     model_name: str,
     layer_idx: int,
@@ -273,12 +375,14 @@ def train_sae(
     batch_size: int,
     shard_size: int,
     l1_coef: float,
+    topk: int,
     num_epochs: int,
     num_train_samples: Optional[int],
     num_val_samples: Optional[int],
     wandb_project: str,
     wandb_run_name: str,
     overwrite_cache: bool = False,
+    sae_type: str = "relu",
 ) -> None:
     """Train a sparse autoencoder on LLama activations with validation."""
 
@@ -292,9 +396,11 @@ def train_sae(
         "batch_size": batch_size,
         "shard_size": shard_size,
         "l1_coef": l1_coef,
+        "topk": topk,
         "num_epochs": num_epochs,
         "num_train_samples": num_train_samples,
         "num_val_samples": num_val_samples,
+        "sae_type": sae_type,
     }
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
@@ -340,17 +446,22 @@ def train_sae(
         d_hidden = d_input * expansion_factor
 
     print(f"Initializing SAE with input dim {d_input} and hidden dim {d_hidden}")
-    sae = SparseAutoencoder(d_input, d_hidden).to(device)
+
+    if sae_type == "relu":
+        sae = SparseReLUAutoencoder(d_input, d_hidden, l1_coef=l1_coef).to(device)
+    elif sae_type == "topk":
+        sae = SparseTopKAutoEncoder(d_input, d_hidden, topk=topk).to(device)
 
     # Create data loaders
-    train_loader = ActivationLoader(cache_dir, "train", batch_size=batch_size)
+    train_loader = ActivationLoader(
+        cache_dir, "train", batch_size=batch_size, shuffle=True
+    )
     val_loader = ActivationLoader(
         cache_dir, "validation", batch_size=batch_size, shuffle=False
     )
 
     # Training setup
     optimizer = torch.optim.Adam(sae.parameters(), lr=learning_rate)
-    mse_loss = nn.MSELoss()
 
     ctx = torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
 
@@ -365,21 +476,19 @@ def train_sae(
             for batch in val_loader:
                 with ctx:
                     batch = batch.to(device, dtype=torch.bfloat16)
-                    decoded, encoded = sae(batch)
+                    output = sae(batch)
 
-                recon = mse_loss(decoded.float(), batch.float())
-                l1 = l1_coef * encoded.abs().mean()
-                loss = recon + l1
-
-                total_recon_loss += recon.item()
-                total_l1_loss += l1.item()
-                total_loss += loss.item()
+                total_recon_loss += output["recon_loss"].item()
+                total_l1_loss += output["l1_loss"].item()
+                total_loss += output["loss"].item()
+                total_l0_loss += output["l0_loss"].item()
                 num_batches += 1
 
         return {
             "val_loss": total_loss / num_batches,
             "val_recon_loss": total_recon_loss / num_batches,
             "val_l1_loss": total_l1_loss / num_batches,
+            "val_l0_loss": total_l0_loss / num_batches,
         }
 
     # Training loop
@@ -398,28 +507,23 @@ def train_sae(
 
             with ctx:
                 batch = batch.to(device, dtype=torch.bfloat16)
+                output = sae(batch)
 
-                decoded, encoded = sae(batch)
-
-            # Compute losses
-            recon = mse_loss(decoded.float(), batch.float())
-            l1 = l1_coef * encoded.abs().mean()
-            loss = recon + l1
-
-            loss.backward()
+            output["loss"].backward()
             optimizer.step()
 
-            total_loss += loss.item()
-            recon_loss += recon.item()
-            l1_loss += l1.item()
+            total_loss += output["loss"].item()
+            recon_loss += output["recon_loss"].item()
+            l1_loss += output["l1_loss"].item()
             batch_count += 1
 
             # Log training metrics periodically
             if batch_count % 100 == 1:
                 metrics = {
-                    "train_loss": loss.item(),
-                    "train_recon_loss": recon.item(),
-                    "train_l1_loss": l1.item(),
+                    "train_loss": output["loss"].item(),
+                    "train_recon_loss": output["recon_loss"].item(),
+                    "train_l1_loss": output["l1_loss"].item(),
+                    "train_l0_loss": output["l0_loss"].item(),
                     "epoch": epoch,
                     "batch": batch_count,
                 }
