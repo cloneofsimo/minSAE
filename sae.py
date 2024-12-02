@@ -223,7 +223,6 @@ class ActivationLoader:
         for shard_path in self.shard_paths[self.next_shard_idx : end_idx]:
             self.current_shards.append(self.load_shard(shard_path))
 
-        print("Loaded new shards", self.current_shards)
         self.next_shard_idx = end_idx
 
         # Concatenate shards and create shuffled indices
@@ -452,6 +451,10 @@ def train_sae(
     elif sae_type == "topk":
         sae = SparseTopKAutoEncoder(d_input, d_hidden, topk=topk).to(device)
 
+    # initialize bias = 0, dec as enc transpose
+    sae.decoder.bias.data.zero_()
+    sae.decoder.weight.data = sae.encoder.weight.data.T
+
     # Create data loaders
     train_loader = ActivationLoader(
         cache_dir, "train", batch_size=batch_size, shuffle=True
@@ -469,6 +472,7 @@ def train_sae(
         sae.eval()
         total_recon_loss = 0.0
         total_l1_loss = 0.0
+        total_l0_loss = 0.0
         total_loss = 0.0
         num_batches = 0
 
@@ -480,8 +484,8 @@ def train_sae(
 
                 total_recon_loss += output["recon_loss"].item()
                 total_l1_loss += output["l1_loss"].item()
-                total_loss += output["loss"].item()
                 total_l0_loss += output["l0_loss"].item()
+                total_loss += output["loss"].item()
                 num_batches += 1
 
         return {
